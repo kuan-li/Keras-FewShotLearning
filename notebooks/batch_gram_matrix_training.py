@@ -1,5 +1,5 @@
-#%%
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 
 import imgaug.augmenters as iaa
@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import shutil
 import tensorflow as tf
+import tensorflow_addons as tfa
 import yaml
 from tensorflow.keras import applications as keras_applications
 from tensorflow.keras.callbacks import (
@@ -19,14 +20,16 @@ from tensorflow.keras.layers import Activation
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.optimizers import Adam
 
+from keras_fsl.dataframe.operators import ToKShotDataset
 from keras_fsl.models import SiameseNets
 from keras_fsl.models.layers import Classification, GramMatrix
 from keras_fsl.sequences import prediction, training
 from keras_fsl.losses import binary_crossentropy, accuracy, mean_score_classification_loss, min_eigenvalue
+from keras_fsl.utils import compose
 # tf.config.experimental_run_functions_eagerly(True)
 
 #%% Init data
-output_folder = Path('logs') / 'kernel_loss' / datetime.today().strftime('%Y%m%d-%H%M%S')
+output_folder = Path('logs') / 'batch_gram_training' / datetime.today().strftime('%Y%m%d-%H%M%S')
 output_folder.mkdir(parents=True, exist_ok=True)
 try:
     shutil.copy(__file__, output_folder / 'training_pipeline.py')
@@ -38,7 +41,14 @@ all_annotations = (
     .assign(
         day=lambda df: df.image_name.str.slice(3, 11),
         image_name=lambda df: 'data/images/cropped_images/' + df.image_name,
+        label_one_hot=lambda df: pd.get_dummies(df.label).values.tolist(),
+        crop_y=lambda df: df.y1,
+        crop_x=lambda df: df.x1,
+        crop_height=lambda df: df.y2 - df.y1,
+        crop_width=lambda df: df.x2 - df.x1,
+        crop_window=lambda df: df[['crop_y', 'crop_x', 'crop_height', 'crop_width']].values.tolist(),
     )
+    .filter(items=['day', 'image_name', 'crop_window', 'label', 'label_one_hot'])
 )
 train_val_test_split = yaml.safe_load(open('data/annotations/cropped_images_split.yaml'))
 train_set = all_annotations.loc[lambda df: df.day.isin(train_val_test_split['train_set_dates'])]
@@ -72,19 +82,28 @@ model = Sequential([
 ])
 
 #%% Init training
-preprocessing = iaa.Sequential([
-    iaa.Fliplr(0.5),
-    iaa.Flipud(0.5),
-    iaa.Affine(rotate=(-180, 180)),
-    iaa.CropToFixedSize(224, 224, position='center'),
-    iaa.PadToFixedSize(224, 224, position='center'),
-    iaa.AssertShape((None, 224, 224, 3)),
-    iaa.Lambda(lambda images_list, *_: (
-        getattr(keras_applications, branch_model_name.lower())
-        .preprocess_input(np.stack(images_list), data_format='channels_last')
-    )),
-])
-batch_size = 64
+preprocessing = compose(
+    partial(tf.cast, dtype=tf.float32),
+    tf.image.random_flip_left_right,
+    tf.image.random_flip_up_down,
+    partial(tfa.image.rotate, angles=2),
+    partial(tf.image.resize_with_crop_or_pad, target_height=224, target_width=224),
+    partial(getattr(keras_applications, branch_model_name.lower()).preprocess_input, data_format='channels_last'),
+)
+#
+# preprocessing = iaa.Sequential([
+#     iaa.Fliplr(0.5),
+#     iaa.Flipud(0.5),
+#     iaa.Affine(rotate=(-180, 180)),
+#     iaa.CropToFixedSize(224, 224, position='center'),
+#     iaa.PadToFixedSize(224, 224, position='center'),
+#     iaa.AssertShape((None, 224, 224, 3)),
+#     iaa.Lambda(lambda images_list, *_: (
+#         getattr(keras_applications, branch_model_name.lower())
+#         .preprocess_input(np.stack(images_list), data_format='channels_last')
+#     )),
+# ])
+
 callbacks = [
     TensorBoard(output_folder, write_images=True, histogram_freq=1),
     ModelCheckpoint(
@@ -100,44 +119,35 @@ callbacks = [
     ),
     ReduceLROnPlateau(),
 ]
-train_sequence = training.single.KShotNWaySequence(
-    train_set,
-    preprocessings=preprocessing,
-    batch_size=batch_size,
-    labels_in_input=False,
-    labels_in_output=True,
-    to_categorical=True,
-    k_shot=batch_size // 8,
-    n_way=8,
+train_dataset = (
+    train_set
+    .pipe(ToKShotDataset(k_shot=8))
+    .map(lambda annotation: (preprocessing(annotation['image']), tf.cast(annotation['label_one_hot'], tf.float32)))
 )
-val_sequence = training.single.KShotNWaySequence(
-    val_set,
-    preprocessings=preprocessing,
-    batch_size=batch_size,
-    labels_in_input=False,
-    labels_in_output=True,
-    to_categorical=True,
-    k_shot=batch_size // 8,
-    n_way=8,
+val_dataset = (
+    val_set
+    .pipe(ToKShotDataset(k_shot=8))
+    .map(lambda annotation: (preprocessing(annotation['image']), tf.cast(annotation['label_one_hot'], tf.float32)))
 )
 
 #%% Train model with loss on kernel
 siamese_nets.get_layer('branch_model').trainable = False
 optimizer = Adam(lr=1e-4)
 margin = 0.05
+batch_size = 64
 model.compile(
     optimizer=optimizer,
     loss=binary_crossentropy(margin),
     metrics=[binary_crossentropy(0.0), accuracy(margin), mean_score_classification_loss, min_eigenvalue],
 )
-model.fit_generator(
-    train_sequence,
-    validation_data=val_sequence,
-    callbacks=callbacks,
+model.fit(
+    train_dataset.batch(batch_size),
+    steps_per_epoch=len(train_set) // batch_size,
+    validation_data=val_dataset.batch(batch_size),
+    validation_steps=len(val_set) // batch_size,
     initial_epoch=0,
     epochs=10,
-    use_multiprocessing=False,
-    workers=0,
+    callbacks=callbacks,
 )
 
 siamese_nets.get_layer('branch_model').trainable = True
@@ -147,14 +157,14 @@ model.compile(
     loss=binary_crossentropy(margin),
     metrics=[binary_crossentropy(0.0), accuracy(margin), mean_score_classification_loss, min_eigenvalue],
 )
-model.fit_generator(
-    train_sequence,
-    validation_data=val_sequence,
-    callbacks=callbacks,
+model.fit(
+    train_dataset.batch(batch_size),
+    steps_per_epoch=len(train_set) // batch_size,
+    validation_data=val_dataset.batch(batch_size),
+    validation_steps=len(val_set) // batch_size,
     initial_epoch=10,
     epochs=100,
-    use_multiprocessing=False,
-    workers=0,
+    callbacks=callbacks,
 )
 
 model.save(output_folder / 'final_model.h5')
