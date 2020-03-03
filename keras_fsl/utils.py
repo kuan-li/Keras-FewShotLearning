@@ -2,12 +2,15 @@ import os
 from functools import wraps
 from unittest.mock import patch
 
+import tensorflow as tf
+
 
 def patch_len(fit_generator):
     """
     Patch __len__ method generator to returns steps_per_epoch args of keras.fit_generator instead of actual len. This is
     to prevent queues to be initialized with way to many items.
     """
+
     @wraps(fit_generator)
     def fit_generator_patch_len(*args, **kwargs):
         generator = args[1]
@@ -37,10 +40,12 @@ def default_workers(fit_generator):
     """
     Patch default number of workers of keras.fit_generator from 1 to os.cpu_count()
     """
+
     @wraps(fit_generator)
     def fit_generator_with_default_cpu_count_worker(*args, **kwargs):
         if not kwargs.get('workers'):
             kwargs['workers'] = os.cpu_count()
 
         return fit_generator(*args, **kwargs)
+
     return fit_generator_with_default_cpu_count_worker
