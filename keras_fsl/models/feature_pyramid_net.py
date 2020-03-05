@@ -127,7 +127,9 @@ def FeaturePyramidNet(
             for anchor in anchors.itertuples()
         ]
         outputs = Concatenate(axis=1)([
-            Lambda(lambda output: tf.concat([output, tf.expand_dims(tf.ones(tf.shape(output)[:2], dtype=output.dtype) * index, -1)], axis=-1))(outputs[index])
+            Lambda(lambda output, index_=index: (
+                tf.concat([output, tf.expand_dims(tf.ones(tf.shape(output)[:2], dtype=output.dtype) * index_, -1)], axis=-1)
+            ))(outputs[index])
             for index, anchor in anchors.iterrows()
         ])
 
